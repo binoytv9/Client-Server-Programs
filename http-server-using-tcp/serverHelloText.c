@@ -1,6 +1,7 @@
 #include<stdio.h>
 #include<netdb.h>
 #include<errno.h>
+#include<fcntl.h>
 #include<string.h>
 #include<stdlib.h>
 #include<unistd.h>
@@ -10,11 +11,12 @@
 #include<sys/types.h>
 #include<sys/socket.h>
 #include<netinet/in.h>
-#include<fcntl.h>
 
-#define PORT "8000"
-#define BACKLOG 10
+#define BACKLOG 10 	// pending connection queue
+#define PORT "8000"	// port to connect
 #define MAX_COUNT 1024
+#define MAX_LENGTH 1024
+
 
 void sigchld_handler(int s)
 {
@@ -30,21 +32,21 @@ void *get_in_addr(struct sockaddr *sa)
 
 int main(int argc, char *argv[])
 {
+	int rv;
+	int yes=1;
 	int sockfd, new_fd;
-	struct addrinfo hints, *servinfo, *p;
-	struct sockaddr_storage their_addr;
 	socklen_t sin_size;
 	struct sigaction sa;
-	int yes=1;
 	char s[INET6_ADDRSTRLEN];
-	int rv;
+	struct sockaddr_storage their_addr;
+	struct addrinfo hints, *servinfo, *p;
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
 
-	if((rv = getaddrinfo("127.0.0.1", PORT, &hints, &servinfo)) != 0){
+	if((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0){
 		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
 		return 1;
 	}
@@ -74,14 +76,14 @@ int main(int argc, char *argv[])
 		return 2;
 	}
 
-	freeaddrinfo(servinfo);
+	freeaddrinfo(servinfo); //free the linkedlist
 
 	if(listen(sockfd, BACKLOG) == -1){
 		perror("listen");
 		exit(1);
 	}
 
-	sa.sa_handler = sigchld_handler;
+	sa.sa_handler = sigchld_handler; // reap all dead processes
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = SA_RESTART;
 	if(sigaction(SIGCHLD, &sa, NULL) == -1){
@@ -90,6 +92,14 @@ int main(int argc, char *argv[])
 	}
 
 	printf("server: waiting for connection...\n");
+
+	int file_fd;
+	ssize_t bytes_read;
+	char url[MAX_LENGTH];
+	char buffer[MAX_LENGTH];
+	char method[MAX_LENGTH];
+	char filename[MAX_LENGTH];
+	char protocol[MAX_LENGTH];
 
 	while(1){
 		sin_size = sizeof their_addr;
@@ -101,16 +111,36 @@ int main(int argc, char *argv[])
 		inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof s);
 		printf("server: got connection from %s\n",s);
 
-		char filename[] = "hello.txt";
-		int file_fd = open(filename, O_RDONLY);
+		// read http request
+		bytes_read = recv(new_fd, buffer, sizeof buffer, 0);
+		buffer[bytes_read] = '\0';
+
+		//extract the mathod, url, protocol
+		sscanf(buffer, "%s %s %s", method, url, protocol);
+
+		filename[0] = '\0';
+		if(strcmp(url,"/") == 0) // if file not specified then send "File Not Specified" http response
+			strcpy(filename, "file_not_specified.txt");
+		else // copy url to filename skipping the first '/'
+			strcpy(filename, &url[1]);
+
+		// open file for reading
+		if((file_fd = open(filename, O_RDONLY)) == -1){
+			// file not found then send "File Not Found" http response
+			close(file_fd);
+			strcpy(filename, "not_found.txt");
+			file_fd = open(filename, O_RDONLY);
+		}
 
 		if(!fork()){ // child
 			int msgSend;
 
 			close(sockfd);
 			while((msgSend = sendfile(new_fd, file_fd, NULL, MAX_COUNT)) != 0)
-				if(msgSend == -1)
+				if(msgSend == -1){
 					perror("send");
+					exit(1);
+				}
 			close(file_fd);
 			close(new_fd);
 			exit(0);
